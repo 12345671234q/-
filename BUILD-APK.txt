@@ -1,0 +1,10 @@
+在 Windows 的 Android Studio 中构建 APK：
+
+1. 解压本项目，用 Android Studio 打开项目根目录。
+2. 等待 Gradle Sync 完成。如果提示选择 Gradle JDK，请选择 Android Studio 自带的 JDK。
+3. 菜单选择 Build -> Build App Bundles or APKs -> Build APK(s)。
+4. 构建完成后，APK 位于：app/build/outputs/apk/debug/app-debug.apk
+
+本版本号：0.1.6（versionCode 7）
+
+说明：本次修改环境无法访问 services.gradle.org，因此未能在交付环境下载 Gradle 分发包并完成 APK 编译；核心 Kotlin 逻辑已通过本地编译桩检查；完整 Android 构建仍需 Android SDK 与可下载的 Gradle 8.9。

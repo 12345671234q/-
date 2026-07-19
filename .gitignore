@@ -1,0 +1,7 @@
+.gradle/
+.idea/
+local.properties
+build/
+app/build/
+*.iml
+app-icon-source.png
