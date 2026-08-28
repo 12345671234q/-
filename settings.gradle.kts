@@ -16,4 +16,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "MiCompanionChat"
 include(":app")
-
+include(":csworkout")
