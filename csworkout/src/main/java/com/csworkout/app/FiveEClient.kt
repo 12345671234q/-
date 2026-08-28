@@ -10,20 +10,24 @@ import java.util.concurrent.TimeUnit
 
 class FiveEClient {
     private val client = OkHttpClient.Builder()
-        .connectTimeout(8, TimeUnit.SECONDS)
-        .readTimeout(12, TimeUnit.SECONDS)
+        .connectTimeout(6, TimeUnit.SECONDS)
+        .readTimeout(8, TimeUnit.SECONDS)
         .build()
 
     private suspend fun getJson(url: String): JSONObject = withContext(Dispatchers.IO) {
         val request = Request.Builder()
             .url(url)
             .header("Accept", "application/json")
-            .header("User-Agent", "CSWorkout/0.1")
+            .header("Cache-Control", "no-cache")
+            .header("Pragma", "no-cache")
+            .header("User-Agent", "CSWorkout/0.2")
             .build()
         client.newCall(request).execute().use { response ->
             val text = response.body?.string().orEmpty()
             if (!response.isSuccessful) error("5E 接口 HTTP ${response.code}")
-            val root = JSONObject(text)
+            val root = runCatching { JSONObject(text) }.getOrElse {
+                error("5E 返回了非 JSON 数据")
+            }
             if (root.optBoolean("success", true).not()) {
                 error(root.optString("message").ifBlank { "5E 接口返回失败" })
             }
@@ -56,7 +60,10 @@ class FiveEClient {
         var liveMap: Int? = null
         for (i in 0 until maps.length()) {
             val map = maps.optJSONObject(i) ?: continue
-            if (map.optString("status") == "1") liveMap = map.optString("bout_num").toIntOrNull()
+            if (map.optString("status") == "1") {
+                liveMap = map.optString("display").toIntOrNull()
+                    ?: map.optString("bout_num").toIntOrNull()
+            }
         }
         val effectiveLive = statusCode == 1 || liveMap != null
         val t1 = info.optJSONObject("t1_info") ?: JSONObject()
@@ -102,8 +109,10 @@ class FiveEClient {
         val players = mutableListOf<PlayerRow>()
         appendPlayers(players, bout?.optJSONArray("t1_pr_stats"), "t1")
         appendPlayers(players, bout?.optJSONArray("t2_pr_stats"), "t2")
-        val boutNum = bout?.optString("bout_num")?.toIntOrNull() ?: 1
-        val boutKey = "${bout?.optString("bout_num")}:${bout?.optString("map_name")}"
+        val boutNum = bout?.optString("display")?.toIntOrNull()
+            ?: bout?.optString("bout_num")?.toIntOrNull()
+            ?: 1
+        val boutKey = "${bout?.optString("bout_num")}:${bout?.optString("map_name")}:${bout?.optString("start_time")}" 
         return MatchSnapshot(
             matchId = matchId,
             title = "${t1Info.optString("disp_name", "队伍 1")} VS ${t2Info.optString("disp_name", "队伍 2")}",
@@ -111,6 +120,7 @@ class FiveEClient {
             mapNumber = boutNum,
             mapName = bout?.optString("map_name").orEmpty(),
             mapStatus = bout?.optString("status").orEmpty(),
+            currentRound = bout?.optString("curr_round_num")?.toIntOrNull(),
             team1 = MatchTeam(
                 id = t1Info.optString("id"),
                 name = t1Info.optString("disp_name", "队伍 1"),
@@ -123,8 +133,8 @@ class FiveEClient {
                 logo = t2Info.optString("logo"),
                 seriesScore = global.optString("t2_score").toIntOrNull() ?: 0,
             ),
-            team1MapScore = t1Stats.optString("all_score").toIntOrNull() ?: 0,
-            team2MapScore = t2Stats.optString("all_score").toIntOrNull() ?: 0,
+            team1MapScore = liveScore(t1Stats),
+            team2MapScore = liveScore(t2Stats),
             t1Side = t1Stats.optString("role"),
             t2Side = t2Stats.optString("role"),
             players = players,
@@ -132,15 +142,23 @@ class FiveEClient {
         )
     }
 
+    private fun liveScore(stats: JSONObject): Int {
+        return stats.optString("quick_score").toIntOrNull()
+            ?: stats.optString("all_score").toIntOrNull()
+            ?: 0
+    }
+
     private fun pickCurrentBout(bouts: JSONArray): JSONObject? {
-        var fallback: JSONObject? = null
+        if (bouts.length() == 0) return null
         for (i in 0 until bouts.length()) {
             val item = bouts.optJSONObject(i) ?: continue
             if (item.optString("status") == "1") return item
-            if (item.optString("display") == "1") fallback = item
-            if (fallback == null) fallback = item
         }
-        return fallback ?: bouts.optJSONObject((bouts.length() - 1).coerceAtLeast(0))
+        // Between maps, prefer the first unopened displayed map instead of jumping back to map 1.
+        val ordered = (0 until bouts.length()).mapNotNull { bouts.optJSONObject(it) }
+            .sortedBy { it.optString("display").toIntOrNull() ?: it.optString("bout_num").toIntOrNull() ?: 99 }
+        ordered.firstOrNull { it.optString("status") == "-1" || it.optString("status") == "0" }?.let { return it }
+        return ordered.lastOrNull()
     }
 
     private fun appendPlayers(target: MutableList<PlayerRow>, array: JSONArray?, slot: String) {
@@ -159,7 +177,7 @@ class FiveEClient {
         }
     }
 
-    suspend fun eventRows(matchId: String, limit: Int = 60): List<EventRow> {
+    suspend fun eventRows(matchId: String, limit: Int = 30): List<EventRow> {
         val root = getJson(
             "https://esports-data.5eplaycdn.com/v1/api/csgo/match/$matchId/event/log?update_version=0&limit=$limit"
         )
