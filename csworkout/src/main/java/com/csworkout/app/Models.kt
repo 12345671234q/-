@@ -36,6 +36,7 @@ data class MatchSnapshot(
     val mapNumber: Int,
     val mapName: String,
     val mapStatus: String,
+    val currentRound: Int? = null,
     val team1: MatchTeam,
     val team2: MatchTeam,
     val team1MapScore: Int,
