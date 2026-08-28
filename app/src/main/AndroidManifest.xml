@@ -20,9 +20,20 @@
         android:label="寂墨·旅途版"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
+        android:usesCleartextTraffic="true"
         android:theme="@style/Theme.MiCompanion">
         <activity
             android:name=".MainActivity"
+            android:windowSoftInputMode="adjustResize"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <activity
+            android:name=".WorkoutActivity"
+            android:label="赛事锻炼"
             android:windowSoftInputMode="adjustResize"
             android:exported="true">
             <intent-filter>
