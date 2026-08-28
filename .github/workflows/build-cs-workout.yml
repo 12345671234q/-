@@ -31,11 +31,11 @@ jobs:
           ./gradlew :csworkout:assembleDebug --stacktrace
 
       - name: Name APK
-        run: cp csworkout/build/outputs/apk/debug/csworkout-debug.apk cs-workout-0.1.0-debug.apk
+        run: cp csworkout/build/outputs/apk/debug/csworkout-debug.apk cs-workout-0.2.0-debug.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: cs-workout-0.1.0-debug
-          path: cs-workout-0.1.0-debug.apk
+          name: cs-workout-0.2.0-debug
+          path: cs-workout-0.2.0-debug.apk
           if-no-files-found: error
