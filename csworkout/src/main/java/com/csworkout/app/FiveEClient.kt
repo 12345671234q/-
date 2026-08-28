@@ -112,7 +112,7 @@ class FiveEClient {
         val boutNum = bout?.optString("display")?.toIntOrNull()
             ?: bout?.optString("bout_num")?.toIntOrNull()
             ?: 1
-        val boutKey = "${bout?.optString("bout_num")}:${bout?.optString("map_name")}:${bout?.optString("start_time")}" 
+        val boutKey = "${bout?.optString("bout_num")}:${bout?.optString("map_name")}" 
         return MatchSnapshot(
             matchId = matchId,
             title = "${t1Info.optString("disp_name", "队伍 1")} VS ${t2Info.optString("disp_name", "队伍 2")}",
@@ -154,7 +154,6 @@ class FiveEClient {
             val item = bouts.optJSONObject(i) ?: continue
             if (item.optString("status") == "1") return item
         }
-        // Between maps, prefer the first unopened displayed map instead of jumping back to map 1.
         val ordered = (0 until bouts.length()).mapNotNull { bouts.optJSONObject(it) }
             .sortedBy { it.optString("display").toIntOrNull() ?: it.optString("bout_num").toIntOrNull() ?: 99 }
         ordered.firstOrNull { it.optString("status") == "-1" || it.optString("status") == "0" }?.let { return it }
