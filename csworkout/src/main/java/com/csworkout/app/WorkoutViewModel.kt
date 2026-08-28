@@ -11,6 +11,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import org.json.JSONObject
+import java.io.Closeable
 import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.min
@@ -27,17 +28,22 @@ data class WorkoutUiState(
     val selectedPlayer: PlayerRow? = null,
     val workout: WorkoutPublicState = WorkoutPublicState(),
     val events: List<LiveEvent> = emptyList(),
+    val liveTransport: String = "",
     val lastSyncAt: Long = 0L,
 )
 
 class WorkoutViewModel(app: Application) : AndroidViewModel(app) {
     private val client = FiveEClient()
+    private val mqttClient = FiveEMqttEventClient()
     private val engine = WorkoutEngine(app)
     var state by mutableStateOf(WorkoutUiState(workout = engine.publicState()))
         private set
 
     private var monitorJob: Job? = null
+    private var previewJob: Job? = null
+    private var eventStream: Closeable? = null
     private val seenVersions = mutableSetOf<Long>()
+    private var mqttConnected = false
     private var firstKillSeen = false
     private var watchedRoundKills = 0
     private var watchedFirstDeath = false
@@ -64,12 +70,42 @@ class WorkoutViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun openMatch(match: ScheduleMatch) {
+        stopPreview()
         viewModelScope.launch {
-            state = state.copy(page = AppPage.MATCH_DETAIL, selectedMatch = match, selectedPlayer = null, loading = true, error = "")
+            state = state.copy(page = AppPage.MATCH_DETAIL, selectedMatch = match, selectedPlayer = null, loading = true, error = "", liveTransport = "正在读取5E实时状态…")
             runCatching { client.snapshot(match.id) }
-                .onSuccess { snap -> state = state.copy(snapshot = snap, loading = false, lastSyncAt = System.currentTimeMillis()) }
-                .onFailure { state = state.copy(loading = false, error = friendlyError(it)) }
+                .onSuccess { snap ->
+                    state = state.copy(snapshot = snap, loading = false, lastSyncAt = System.currentTimeMillis(), liveTransport = "详情自动刷新中")
+                    startPreview(match.id)
+                }
+                .onFailure { state = state.copy(loading = false, error = friendlyError(it), liveTransport = "等待5E数据") }
         }
+    }
+
+    private fun startPreview(matchId: String) {
+        stopPreview()
+        previewJob = viewModelScope.launch {
+            while (isActive && state.page == AppPage.MATCH_DETAIL) {
+                delay(1_500)
+                runCatching { client.snapshot(matchId) }
+                    .onSuccess { snap ->
+                        val oldSelected = state.selectedPlayer
+                        val selected = oldSelected?.let { old -> snap.players.firstOrNull { sameName(it.name, old.name) } ?: old }
+                        state = state.copy(
+                            snapshot = snap,
+                            selectedPlayer = selected,
+                            lastSyncAt = System.currentTimeMillis(),
+                            liveTransport = "详情自动刷新中",
+                        )
+                    }
+                    .onFailure { setPassiveNetworkState(it) }
+            }
+        }
+    }
+
+    private fun stopPreview() {
+        previewJob?.cancel()
+        previewJob = null
     }
 
     fun refreshSelectedMatch() {
@@ -77,7 +113,11 @@ class WorkoutViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             state = state.copy(loading = true, error = "")
             runCatching { client.snapshot(id) }
-                .onSuccess { state = state.copy(snapshot = it, loading = false, lastSyncAt = System.currentTimeMillis()) }
+                .onSuccess { snap ->
+                    val oldSelected = state.selectedPlayer
+                    val selected = oldSelected?.let { old -> snap.players.firstOrNull { sameName(it.name, old.name) } ?: old }
+                    state = state.copy(snapshot = snap, selectedPlayer = selected, loading = false, lastSyncAt = System.currentTimeMillis())
+                }
                 .onFailure { state = state.copy(loading = false, error = friendlyError(it)) }
         }
     }
@@ -87,9 +127,10 @@ class WorkoutViewModel(app: Application) : AndroidViewModel(app) {
     fun startWorkout() {
         val matchId = state.snapshot?.matchId ?: state.selectedMatch?.id ?: return
         val player = state.selectedPlayer ?: return
+        stopPreview()
         engine.startSession(matchId, player.name)
         engine.setMapNumber(state.snapshot?.mapNumber ?: 1)
-        state = state.copy(page = AppPage.WORKOUT, workout = engine.publicState(), events = emptyList())
+        state = state.copy(page = AppPage.WORKOUT, workout = engine.publicState(), events = emptyList(), liveTransport = "正在建立实时推送…")
         startMonitor(matchId, player.name)
     }
 
@@ -97,38 +138,70 @@ class WorkoutViewModel(app: Application) : AndroidViewModel(app) {
         runCatching { client.snapshot(matchId) }.onSuccess { snap ->
             val p = snap.players.firstOrNull { sameName(it.name, playerName) }
                 ?: PlayerRow("", playerName, "")
-            state = state.copy(page = AppPage.WORKOUT, snapshot = snap, selectedPlayer = p, workout = engine.publicState())
+            state = state.copy(page = AppPage.WORKOUT, snapshot = snap, selectedPlayer = p, workout = engine.publicState(), liveTransport = "正在恢复实时监听…")
             startMonitor(matchId, playerName)
         }
     }
 
     private fun startMonitor(matchId: String, playerName: String) {
         monitorJob?.cancel()
+        eventStream?.close()
+        eventStream = null
         seenVersions.clear()
+        mqttConnected = false
         firstKillSeen = false
         watchedRoundKills = 0
         watchedFirstDeath = false
-        roundNumber = null
+        roundNumber = state.snapshot?.currentRound
         previousSnapshot = state.snapshot
         updateWatchedSide(state.snapshot, playerName)
+
         monitorJob = viewModelScope.launch {
-            runCatching { client.eventRows(matchId) }.onSuccess { rows -> rows.forEach { seenVersions += it.updateVersion } }
+            val baseline = runCatching { client.eventRows(matchId, 60) }.getOrElse { emptyList() }
+            baseline.forEach { seenVersions += it.updateVersion }
+            seedRoundContext(baseline, playerName)
+
+            eventStream = mqttClient.subscribe(
+                matchId = matchId,
+                onEvent = { row ->
+                    viewModelScope.launch {
+                        if (seenVersions.add(row.updateVersion)) {
+                            processEvent(row, playerName)
+                            state = state.copy(workout = engine.publicState(), lastSyncAt = System.currentTimeMillis())
+                        }
+                    }
+                },
+                onStatus = { connected, label ->
+                    viewModelScope.launch {
+                        mqttConnected = connected
+                        state = state.copy(liveTransport = label)
+                    }
+                },
+            )
+
             var ticks = 0
             while (isActive) {
                 ticks++
-                runCatching { pollEvents(matchId, playerName) }.onFailure { setBackgroundError(it) }
-                if (ticks % 3 == 0) runCatching { pollSnapshot(matchId, playerName) }.onFailure { setBackgroundError(it) }
+                // MQTT is the fast path. HTTP periodically heals any missed event, and becomes the fallback when MQTT is down.
+                val shouldBackfillEvents = if (mqttConnected) ticks % 8 == 0 else ticks % 2 == 0
+                if (shouldBackfillEvents) {
+                    runCatching { pollEvents(matchId, playerName) }.onFailure { setPassiveNetworkState(it) }
+                }
+                if (ticks % 2 == 0) {
+                    runCatching { pollSnapshot(matchId, playerName) }.onFailure { setPassiveNetworkState(it) }
+                }
                 delay(1_000)
             }
         }
     }
 
     private suspend fun pollEvents(matchId: String, playerName: String) {
-        val rows = client.eventRows(matchId)
+        val rows = client.eventRows(matchId, 30)
         val fresh = rows.filter { seenVersions.add(it.updateVersion) }
         fresh.sortedBy { it.updateVersion }.forEach { processEvent(it, playerName) }
-        if (seenVersions.size > 1500) {
-            seenVersions.clear(); rows.forEach { seenVersions += it.updateVersion }
+        if (seenVersions.size > 2500) {
+            val keep = rows.map { it.updateVersion }.toSet()
+            seenVersions.retainAll(keep)
         }
         state = state.copy(workout = engine.publicState(), lastSyncAt = System.currentTimeMillis())
     }
@@ -141,6 +214,12 @@ class WorkoutViewModel(app: Application) : AndroidViewModel(app) {
             val otBlocks = overtimeBlocks(prev.team1MapScore, prev.team2MapScore)
             engine.onMapEnd(watchedWon, otBlocks)
             addUiEvent("MAP_END", "Map ${prev.mapNumber} 结束", "${prev.team1.name} ${prev.team1MapScore}:${prev.team2MapScore} ${prev.team2.name}${if (otBlocks > 0) " · 加时 $otBlocks 档" else ""}")
+            firstKillSeen = false
+            watchedRoundKills = 0
+            watchedFirstDeath = false
+            roundNumber = snap.currentRound
+        } else if (snap.currentRound != null) {
+            roundNumber = snap.currentRound
         }
         previousSnapshot = snap
         engine.setMapNumber(snap.mapNumber)
@@ -148,11 +227,53 @@ class WorkoutViewModel(app: Application) : AndroidViewModel(app) {
         state = state.copy(snapshot = snap, workout = engine.publicState(), lastSyncAt = System.currentTimeMillis())
     }
 
+    private fun seedRoundContext(rows: List<EventRow>, playerName: String) {
+        if (rows.isEmpty()) return
+        val currentMap = state.snapshot?.mapName.orEmpty()
+        var localRound = roundNumber
+        var localFirstKill = false
+        var localKills = 0
+        var localFirstDeath = false
+        rows.filter { currentMap.isBlank() || it.mapName.equals(currentMap, ignoreCase = true) }
+            .sortedBy { it.updateVersion }
+            .forEach { row ->
+                val info = runCatching { JSONObject(row.rawLog) }.getOrNull() ?: return@forEach
+                val roundStart = info.optJSONObject("round_start")
+                if (roundStart != null && roundStart.length() > 0) {
+                    localRound = roundStart.optString("round_num").toIntOrNull() ?: localRound?.plus(1)
+                    localFirstKill = false
+                    localKills = 0
+                    localFirstDeath = false
+                }
+                val kill = info.optJSONObject("kill")
+                if (kill != null && kill.length() > 0) {
+                    val killer = kill.optString("killer_nick").ifBlank { kill.optString("killer_name") }
+                    val victim = kill.optString("victim_nick").ifBlank { kill.optString("victim_name") }
+                    val first = !localFirstKill
+                    localFirstKill = true
+                    if (sameName(killer, playerName)) localKills++
+                    if (sameName(victim, playerName) && first) localFirstDeath = true
+                }
+                val roundEnd = info.optJSONObject("round_end")
+                if (roundEnd != null && roundEnd.length() > 0) {
+                    localFirstKill = false
+                    localKills = 0
+                    localFirstDeath = false
+                }
+            }
+        roundNumber = localRound ?: state.snapshot?.currentRound
+        firstKillSeen = localFirstKill
+        watchedRoundKills = localKills
+        watchedFirstDeath = localFirstDeath
+    }
+
     private fun processEvent(row: EventRow, playerName: String) {
         val info = runCatching { JSONObject(row.rawLog) }.getOrNull() ?: return
         val roundStart = info.optJSONObject("round_start")
-        if (roundStart != null && (roundStart.has("round_num") || roundStart.has("map") || roundStart.has("bout_num"))) {
-            roundNumber = roundStart.optString("round_num").toIntOrNull() ?: roundNumber?.plus(1)
+        if (roundStart != null && roundStart.length() > 0) {
+            roundNumber = roundStart.optString("round_num").toIntOrNull()
+                ?: state.snapshot?.currentRound
+                ?: roundNumber?.plus(1)
             firstKillSeen = false
             watchedRoundKills = 0
             watchedFirstDeath = false
@@ -160,7 +281,7 @@ class WorkoutViewModel(app: Application) : AndroidViewModel(app) {
         }
 
         val kill = info.optJSONObject("kill")
-        if (kill != null) {
+        if (kill != null && kill.length() > 0) {
             val killer = kill.optString("killer_nick").ifBlank { kill.optString("killer_name") }
             val victim = kill.optString("victim_nick").ifBlank { kill.optString("victim_name") }
             if (killer.isNotBlank() && victim.isNotBlank()) {
@@ -180,7 +301,7 @@ class WorkoutViewModel(app: Application) : AndroidViewModel(app) {
         }
 
         val roundEnd = info.optJSONObject("round_end")
-        if (roundEnd != null && roundEnd.has("winner")) {
+        if (roundEnd != null && roundEnd.length() > 0 && roundEnd.has("winner")) {
             val winner = roundEnd.optString("winner")
             val won = watchedSide.isNotBlank() && winner.equals(watchedSide, ignoreCase = true)
             engine.recordRoundEnd(watchedRoundKills, watchedFirstDeath, won)
@@ -191,9 +312,10 @@ class WorkoutViewModel(app: Application) : AndroidViewModel(app) {
                 watchedRoundKills == 2 -> "2K"
                 else -> ""
             }
+            val displayRound = roundNumber ?: state.snapshot?.currentRound
             addUiEvent(
                 if (won) "ROUND_WIN" else "ROUND_END",
-                "第 ${roundNumber ?: "?"} 回合${if (won) "获胜" else "结束"}",
+                "第 ${displayRound ?: "?"} 回合${if (won) "获胜" else "结束"}",
                 listOf("$watchedRoundKills 杀", if (watchedFirstDeath) "首死" else "", label).filter { it.isNotBlank() }.joinToString(" · "),
             )
             watchedRoundKills = 0
@@ -204,8 +326,13 @@ class WorkoutViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun updateWatchedSide(snap: MatchSnapshot?, playerName: String) {
         if (snap == null) return
-        watchedTeamSlot = snap.players.firstOrNull { sameName(it.name, playerName) }?.teamSlot.orEmpty()
-        watchedSide = when (watchedTeamSlot) { "t1" -> snap.t1Side; "t2" -> snap.t2Side; else -> "" }
+        val foundSlot = snap.players.firstOrNull { sameName(it.name, playerName) }?.teamSlot.orEmpty()
+        if (foundSlot.isNotBlank()) watchedTeamSlot = foundSlot
+        watchedSide = when (watchedTeamSlot) {
+            "t1" -> snap.t1Side
+            "t2" -> snap.t2Side
+            else -> watchedSide
+        }
     }
 
     private fun mapWinnerForWatched(snap: MatchSnapshot, playerName: String): Boolean? {
@@ -255,29 +382,46 @@ class WorkoutViewModel(app: Application) : AndroidViewModel(app) {
 
     fun goHome() {
         monitorJob?.cancel(); monitorJob = null
-        state = state.copy(page = AppPage.MATCHES, selectedMatch = null, snapshot = null, selectedPlayer = null)
+        eventStream?.close(); eventStream = null
+        stopPreview()
+        mqttConnected = false
+        state = state.copy(page = AppPage.MATCHES, selectedMatch = null, snapshot = null, selectedPlayer = null, liveTransport = "")
         refreshMatches()
     }
 
     fun backToMatch() {
         if (state.page == AppPage.WORKOUT) return
-        state = state.copy(page = AppPage.MATCHES, selectedMatch = null, snapshot = null, selectedPlayer = null)
+        stopPreview()
+        state = state.copy(page = AppPage.MATCHES, selectedMatch = null, snapshot = null, selectedPlayer = null, liveTransport = "")
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        monitorJob?.cancel()
+        previewJob?.cancel()
+        eventStream?.close()
     }
 
     private fun addUiEvent(type: String, title: String, detail: String = "") {
         state = state.copy(events = (listOf(LiveEvent(type, title, detail)) + state.events).take(80))
     }
 
-    private fun setBackgroundError(t: Throwable) {
-        val message = friendlyError(t)
-        if (message != state.error) state = state.copy(error = message)
+    private fun setPassiveNetworkState(t: Throwable) {
+        val raw = t.message.orEmpty()
+        val note = when {
+            raw.contains("Unable to resolve host", ignoreCase = true) -> "网络暂时连不上5E，后台重试中"
+            raw.contains("timeout", ignoreCase = true) || raw.contains("timed out", ignoreCase = true) ->
+                if (mqttConnected) "实时推送正常 · HTTP补偿接口偶尔超时" else "5E接口超时 · 自动重试中"
+            else -> if (mqttConnected) "实时推送已连接" else "5E数据暂时不稳定 · 自动重试中"
+        }
+        if (state.liveTransport != note) state = state.copy(liveTransport = note)
     }
 
     private fun friendlyError(t: Throwable): String {
         val raw = t.message.orEmpty()
         return when {
-            raw.contains("Unable to resolve host", ignoreCase = true) -> "网络连不上 5E 数据源，稍后再试。"
-            raw.contains("timeout", ignoreCase = true) -> "5E 数据响应超时，正在等下一次刷新。"
+            raw.contains("Unable to resolve host", ignoreCase = true) -> "网络连不上5E数据源，稍后再试。"
+            raw.contains("timeout", ignoreCase = true) || raw.contains("timed out", ignoreCase = true) -> "5E数据响应超时，稍后会自动重试。"
             else -> raw.ifBlank { "发生了一个未知错误" }
         }
     }
