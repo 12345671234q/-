@@ -1,4 +1,4 @@
-name: Build CS Workout V0.4 APK
+name: Build CS Workout V0.4.1 APK
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: cs-workout-v04-${{ github.ref }}
+  group: cs-workout-v041-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -29,6 +29,9 @@ jobs:
           test -f v04src/gradlew
           test -f v04src/csworkout/build.gradle.kts
 
+      - name: Apply V0.4.1 roster patch
+        run: python v04bundle/apply_v041.py
+
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
@@ -45,11 +48,11 @@ jobs:
           ./gradlew :csworkout:assembleDebug --stacktrace
 
       - name: Name APK
-        run: cp v04src/csworkout/build/outputs/apk/debug/csworkout-debug.apk cs-workout-0.4.0-debug.apk
+        run: cp v04src/csworkout/build/outputs/apk/debug/csworkout-debug.apk cs-workout-0.4.1-debug.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: cs-workout-0.4.0-debug
-          path: cs-workout-0.4.0-debug.apk
+          name: cs-workout-0.4.1-debug
+          path: cs-workout-0.4.1-debug.apk
           if-no-files-found: error
