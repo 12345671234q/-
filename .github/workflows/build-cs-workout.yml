@@ -35,11 +35,65 @@ jobs:
           ./gradlew :csworkout:assembleDebug --stacktrace
 
       - name: Name APK
-        run: cp csworkout/build/outputs/apk/debug/csworkout-debug.apk cs-workout-0.2.0-debug.apk
+        run: cp csworkout/build/outputs/apk/debug/csworkout-debug.apk cs-workout-0.3.0-debug.apk
+
+      - name: Pack standalone source
+        run: |
+          rm -rf cs-workout-source
+          mkdir -p cs-workout-source
+          cp -R csworkout cs-workout-source/
+          cp build.gradle.kts gradle.properties gradlew gradlew.bat cs-workout-source/
+          cp -R gradle cs-workout-source/
+          cat > cs-workout-source/settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = "CSWorkout"
+          include(":csworkout")
+          EOF
+          cat > cs-workout-source/README-SOURCE.txt <<'EOF'
+          CS Workout Android source package
+          Branch source: agent/cs-workout-standalone
+          State-machine build: V0.3
+
+          Open this folder directly in Android Studio.
+          The Android application module is :csworkout.
+
+          Main code:
+          csworkout/src/main/java/com/csworkout/app/
+
+          Core files:
+          - FiveEClient.kt: 5E schedule/snapshot/HTTP event access
+          - FiveEMqttEventClient.kt: live MQTT/WebSocket transport
+          - WorkoutViewModel.kt: live match state machine and event handling
+          - WorkoutEngine.kt: DU/debt/action planning logic
+          - WorkoutApp.kt: Jetpack Compose UI
+          EOF
+          (cd cs-workout-source && zip -r ../cs-workout-source-v0.3.0.zip .)
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: cs-workout-0.2.0-debug
-          path: cs-workout-0.2.0-debug.apk
+          name: cs-workout-0.3.0-debug
+          path: cs-workout-0.3.0-debug.apk
+          if-no-files-found: error
+
+      - name: Upload source
+        uses: actions/upload-artifact@v4
+        with:
+          name: cs-workout-source-v0.3.0
+          path: cs-workout-source-v0.3.0.zip
           if-no-files-found: error
